@@ -1,0 +1,15 @@
+pandas 
+numpy 
+scipy 
+statsmodels 
+yfinance 
+lightgbm 
+scikit-learn 
+optuna 
+shap 
+mapie 
+boto3 
+jupyter 
+matplotlib 
+seaborn 
+openpyxl
