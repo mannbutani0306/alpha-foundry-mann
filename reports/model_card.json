@@ -1,0 +1,16 @@
+{
+  "model_id": "ZETHETA_LAMBDARANK_ENS_V1",
+  "universe": "NSE Liquid Universe (~15 names)",
+  "objective": "Learning-to-Rank (LambdaMART / NDCG)",
+  "validation_scheme": "Purged 5-Fold Time-Series Cross-Validation (21d embargo)",
+  "metrics": {
+    "out_of_sample_rank_ic": 0.0552,
+    "expected_calibration_error_ece": 0.0,
+    "conformal_confidence_level": "80%"
+  },
+  "governance": {
+    "point_in_time_enforced": true,
+    "survivorship_safe": true,
+    "approval_status": "APPROVED_FOR_SHORTLIST_GENERATION"
+  }
+}

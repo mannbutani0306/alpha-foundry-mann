@@ -1,85 +1,174 @@
-import pandas as pd
-import numpy as np
-import lightgbm as lgb
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import roc_auc_score, log_loss
 import os
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import joblib
+from scipy.stats import spearmanr
+from sklearn.isotonic import IsotonicRegression
 
-def train_alpha_model(df, feature_cols, target_col='target_outperform', n_splits=5):
+def purged_time_splits(dates_sorted, n_splits=5, embargo=21):
     """
-    Trains a LightGBM Classifier using Time-Series Cross-Validation.
-    Evaluates out-of-sample AUC-ROC and Information Coefficients per fold.
+    Splits dates sequentially without shuffling, enforcing an embargo period
+    between training and validation to prevent future leakage.
     """
-    df = df.sort_values('date').reset_index(drop=True)
+    unique_dates = np.array(sorted(pd.unique(dates_sorted)))
+    fold_size = len(unique_dates) // (n_splits + 1)
     
-    # Get unique trading dates for time-series group splitting
-    unique_dates = df['date'].unique()
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    
-    oof_predictions = np.zeros(len(df))
-    fold_metrics = []
-    
-    print(f"\n--- Starting LightGBM Cross-Validation ({n_splits} Folds) ---")
-    
-    for fold, (train_date_idx, val_date_idx) in enumerate(tscv.split(unique_dates)):
-        # Apply embargo: Purge overlap between train and validation sets
-        # Remove last 21 trading days from train set to avoid target leakage
-        train_dates = unique_dates[train_date_idx][:-21]
-        val_dates = unique_dates[val_date_idx]
+    splits = []
+    for k in range(1, n_splits + 1):
+        tr_end = fold_size * k
+        va_start = tr_end + embargo
+        va_end = va_start + fold_size
         
-        train_mask = df['date'].isin(train_dates)
-        val_mask = df['date'].isin(val_dates)
+        train_dates = set(unique_dates[:tr_end])
+        valid_dates = set(unique_dates[va_start:va_end])
         
-        X_train, y_train = df.loc[train_mask, feature_cols], df.loc[train_mask, target_col]
-        X_val, y_val = df.loc[val_mask, feature_cols], df.loc[val_mask, target_col]
-        
-        if len(X_train) == 0 or len(X_val) == 0:
-            continue
+        if len(valid_dates) > 0:
+            splits.append((train_dates, valid_dates))
             
-        # LightGBM Model Configuration
-        model = lgb.LGBMClassifier(
-            n_estimators=100,
-            learning_rate=0.03,
-            max_depth=3,
-            num_leaves=7,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            random_state=42,
-            verbose=-1
-        )
-        
-        model.fit(X_train, y_train)
-        
-        # Validation Probabilities
-        val_preds = model.predict_proba(X_val)[:, 1]
-        oof_predictions[val_mask] = val_preds
-        
-        auc = roc_auc_score(y_val, val_preds)
-        print(f"Fold {fold + 1} | Train Size: {len(X_train)} | Val Size: {len(X_val)} | Validation AUC: {auc:.4f}")
-        fold_metrics.append(auc)
-        
-    print(f"\nMean OOF AUC Score across folds: {np.mean(fold_metrics):.4f}")
+    return splits
+
+def compute_daily_ic(df, score_col='score', target_col='fwd_ret_21d'):
+    """Calculates Spearman Rank Information Coefficient (IC) per date."""
+    def _ic(g):
+        g = g.dropna(subset=[score_col, target_col])
+        if len(g) < 5:
+            return np.nan
+        return spearmanr(g[score_col], g[target_col]).correlation
+
+    ic_series = df.groupby('date').apply(_ic).dropna()
+    mean_ic = ic_series.mean()
+    ic_std = ic_series.std(ddof=1)
+    ic_ir = mean_ic / (ic_std + 1e-12)
+    t_stat = ic_ir * np.sqrt(len(ic_series))
     
-    # Fit final model on all data for deployment
-    final_model = lgb.LGBMClassifier(
-        n_estimators=100, learning_rate=0.03, max_depth=3, num_leaves=7, random_state=42, verbose=-1
+    return mean_ic, ic_ir, t_stat
+
+def compute_ece(p_cal, y_cal, n_bins=10):
+    """Computes Expected Calibration Error (ECE)."""
+    edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        mask = (p_cal > lo) & (p_cal <= hi)
+        if mask.sum() > 0:
+            acc = y_cal[mask].mean()
+            conf = p_cal[mask].mean()
+            ece += (mask.sum() / len(p_cal)) * np.abs(acc - conf)
+    return ece
+
+def train_lambdarank_engine(data_path="data/processed/processed_factors.parquet"):
+    print(f"Loading factor data from {data_path}...")
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Data file not found at {data_path}. Ensure factor_engineering.py was run.")
+
+    df = pd.read_parquet(data_path)
+    df = df.sort_values('date').reset_index(drop=True)
+
+    target_col = 'fwd_ret_21d'
+    
+    # Strictly exclude non-predictive/target columns
+    exclude_cols = {
+        'date', 'Ticker', 'symbol', 'close', 'open', 'high', 'low', 'volume', 
+        'dividends', 'stock splits', 'fwd_ret_21d', 'target_rel_ret', 
+        'target_outperform', 'label', 'relevance'
+    }
+
+    candidate_features = [c for c in df.columns if c not in exclude_cols]
+
+    # Z-score standardization across cross-section
+    z_feature_cols = []
+    for c in candidate_features:
+        z_col = f"{c}_z" if not c.endswith('_z') else c
+        if z_col not in df.columns:
+            df[z_col] = df.groupby('date')[c].transform(
+                lambda s: (s - s.mean()) / (s.std() + 1e-9)
+            ).fillna(0.0)
+        z_feature_cols.append(z_col)
+
+    z_feature_cols = list(dict.fromkeys(z_feature_cols))
+
+    # Define binary target for propensity calibration (1 if return > daily median return)
+    df['binary_outperform'] = (
+        df[target_col] > df.groupby('date')[target_col].transform('median')
+    ).astype(int)
+
+    # Convert continuous target into 5 quintile relevance grades for LambdaRank
+    df['relevance'] = df.groupby('date')[target_col].transform(
+        lambda s: pd.qcut(s.rank(method='first'), 5, labels=False)
     )
-    final_model.fit(df[feature_cols], df[target_col])
+
+    splits = purged_time_splits(df['date'].values, n_splits=5, embargo=21)
     
-    return final_model, fold_metrics
+    fold_ics = []
+    oof_predictions = []
+
+    for fold, (train_dates, valid_dates) in enumerate(splits, 1):
+        tr_df = df[df['date'].isin(train_dates)].copy()
+        va_df = df[df['date'].isin(valid_dates)].copy()
+
+        grp_tr = tr_df.groupby('date', sort=False).size().to_numpy()
+        grp_va = va_df.groupby('date', sort=False).size().to_numpy()
+
+        X_tr, y_tr = tr_df[z_feature_cols].to_numpy(), tr_df['relevance'].to_numpy()
+        X_va, y_va = va_df[z_feature_cols].to_numpy(), va_df['relevance'].to_numpy()
+
+        dtr = lgb.Dataset(X_tr, label=y_tr, group=grp_tr)
+        dva = lgb.Dataset(X_va, label=y_va, group=grp_va, reference=dtr)
+
+        params = {
+            'objective': 'lambdarank',
+            'metric': 'ndcg',
+            'ndcg_eval_at': [5, 10],
+            'learning_rate': 0.03,
+            'num_leaves': 31,
+            'min_data_in_leaf': 20,
+            'feature_fraction': 0.8,
+            'bagging_fraction': 0.8,
+            'bagging_freq': 1,
+            'verbose': -1
+        }
+
+        model = lgb.train(
+            params,
+            dtr,
+            num_boost_round=500,
+            valid_sets=[dva],
+            callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)]
+        )
+
+        va_df['raw_score'] = model.predict(X_va)
+        mean_ic, ic_ir, t_stat = compute_daily_ic(va_df, score_col='raw_score', target_col=target_col)
+        fold_ics.append(mean_ic)
+
+        oof_predictions.append(va_df[['date', 'Ticker', 'raw_score', 'binary_outperform', target_col]])
+        print(f"Fold {fold} | Mean Rank IC: {mean_ic:.4f} | IC-IR: {ic_ir:.4f}")
+
+    # Combine out-of-fold validation predictions for probability calibration
+    oof_df = pd.concat(oof_predictions, ignore_index=True)
+
+    # Fit Isotonic Calibration on OOF raw scores
+    calibrator = IsotonicRegression(out_of_bounds='clip')
+    
+    # Normalize raw scores to 0-1 range prior to Isotonic fitting
+    raw_min, raw_max = oof_df['raw_score'].min(), oof_df['raw_score'].max()
+    norm_scores = (oof_df['raw_score'] - raw_min) / (raw_max - raw_min + 1e-9)
+    
+    calibrator.fit(norm_scores, oof_df['binary_outperform'])
+    oof_df['calibrated_propensity'] = calibrator.predict(norm_scores)
+
+    ece_val = compute_ece(oof_df['calibrated_propensity'].values, oof_df['binary_outperform'].values)
+
+    # Save models and calibration objects
+    os.makedirs("data/models", exist_ok=True)
+    joblib.dump(model, "data/models/lambdarank_model.pkl")
+    joblib.dump(calibrator, "data/models/isotonic_calibrator.pkl")
+    joblib.dump({'raw_min': raw_min, 'raw_max': raw_max}, "data/models/score_scaler.pkl")
+
+    print("--------------------------------------------------")
+    print(f"Overall Cross-Validated Out-of-Sample Rank IC: {np.nanmean(fold_ics):.4f}")
+    print(f"Isotonic Calibration Completed. Out-of-Sample ECE: {ece_val:.4f}")
+    print(f"Saved artifacts to 'data/models/' directory.")
+    print("--------------------------------------------------")
 
 if __name__ == "__main__":
-    # Load normalized factor dataset
-    input_path = "data/processed/normalized_factors.parquet"
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Missing {input_path}. Run factor_engineering.py first!")
-        
-    df = pd.read_parquet(input_path)
-    
-    # Features (z-score normalized factors)
-    feature_cols = [c for c in df.columns if c.endswith('_zscore')]
-    
-    # Train Model
-    model, metrics = train_alpha_model(df, feature_cols)
-    
-    print("\nModel Training Completed Successfully!")
+    train_lambdarank_engine()
