@@ -6,6 +6,7 @@ from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
 from sklearn.linear_model import Ridge
 from scipy.stats import spearmanr
 import optuna
+from optuna.samplers import TPESampler
 import joblib
 
 # Suppress Optuna verbose logging
@@ -59,7 +60,10 @@ def optimize_lambdarank(df, z_feature_cols, target_col='fwd_ret_21d', n_trials=1
             'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 1.0),
             'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 1.0),
             'bagging_freq': 1,
-            'verbose': -1
+            'verbose': -1,
+            'seed': 42,
+            'bagging_seed': 42,
+            'feature_fraction_seed': 42
         }
         
         fold_ics = []
@@ -84,7 +88,7 @@ def optimize_lambdarank(df, z_feature_cols, target_col='fwd_ret_21d', n_trials=1
 
         return float(np.nanmean(fold_ics))
 
-    study = optuna.create_study(direction='maximize')
+    study = optuna.create_study(direction='maximize', sampler=TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials)
     print(f"Optuna Best Trial OOS Rank IC: {study.best_value:.4f}")
     print(f"Optuna Best Params: {study.best_params}")
@@ -120,7 +124,14 @@ def run_ensemble_stacking_pipeline(data_path="data/processed/processed_factors.p
 
     # 1. Run Optuna HPO to get best LightGBM parameters
     best_lgb_params = optimize_lambdarank(df, z_feature_cols, target_col=target_col, n_trials=10)
-    best_lgb_params.update({'objective': 'lambdarank', 'metric': 'ndcg', 'verbose': -1})
+    best_lgb_params.update({
+        'objective': 'lambdarank',
+        'metric': 'ndcg',
+        'verbose': -1,
+        'seed': 42,
+        'bagging_seed': 42,
+        'feature_fraction_seed': 42
+    })
 
     splits = purged_time_splits(df['date'].values, n_splits=5, embargo=21)
 

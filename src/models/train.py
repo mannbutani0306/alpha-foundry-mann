@@ -125,6 +125,9 @@ def train_lambdarank_engine(data_path="data/processed/processed_factors.parquet"
             'feature_fraction': 0.8,
             'bagging_fraction': 0.8,
             'bagging_freq': 1,
+            'seed': 42,
+            'bagging_seed': 42,
+            'feature_fraction_seed': 42,
             'verbose': -1
         }
 

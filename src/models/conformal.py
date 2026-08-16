@@ -136,16 +136,25 @@ def run_conformal_pipeline(data_path="data/processed/processed_factors.parquet")
     )
     test_df['conformal_admit_mondrian'] = admit_mondrian
 
-    # Evaluate empirical coverage on test set
-    split_coverage = (test_df[test_df['conformal_admit_split']]['binary_outperform']).mean()
-    mondrian_coverage = (test_df[test_df['conformal_admit_mondrian']]['binary_outperform']).mean()
+    # --- PRECISION: of the stocks ADMITTED into the shortlist, what fraction actually outperformed? ---
+    # (This is what the original code computed and mislabeled with "coverage" variable names.)
+    split_precision = (test_df[test_df['conformal_admit_split']]['binary_outperform']).mean()
+    mondrian_precision = (test_df[test_df['conformal_admit_mondrian']]['binary_outperform']).mean()
+
+    # --- COVERAGE: of the stocks that TRULY outperformed, what fraction did we admit? ---
+    # This is the quantity conformal prediction's (1 - alpha) guarantee actually refers to.
+    true_outperformers = test_df[test_df['binary_outperform'] == 1]
+    split_coverage_rate = true_outperformers['conformal_admit_split'].mean()
+    mondrian_coverage_rate = true_outperformers['conformal_admit_mondrian'].mean()
 
     print("--------------------------------------------------")
     print("Conformal Prediction Pipeline Completed.")
     print(f"Target Coverage Level (1 - alpha): {(1 - alpha)*100:.1f}%")
     print(f"Global Split-Conformal q_hat Threshold: {q_hat_global:.4f}")
-    print(f"Empirical Outperformance Precision (Split Set): {split_coverage*100:.2f}%")
-    print(f"Empirical Outperformance Precision (Mondrian Set): {mondrian_coverage*100:.2f}%")
+    print(f"Empirical Outperformance Precision (Split Set): {split_precision*100:.2f}%")
+    print(f"Empirical Outperformance Precision (Mondrian Set): {mondrian_precision*100:.2f}%")
+    print(f"Empirical Coverage (Split Set): {split_coverage_rate*100:.2f}%")
+    print(f"Empirical Coverage (Mondrian Set): {mondrian_coverage_rate*100:.2f}%")
     print(f"Mondrian Sector Thresholds: {sector_q_hats}")
     print("--------------------------------------------------")
 

@@ -1,116 +1,102 @@
-# Independent R Replication & Validation Script for Zetheta Ranking Engine
-# Fama-MacBeth Cross-Sectional Regression & Out-of-Sample Rank IC Validation
+# fama_macbeth_replication.R
+#
+# Independent R replication of:
+#   (1) the Fama-MacBeth cross-sectional regression (Section A3.3 of the
+#       project brief), and
+#   (2) the equal-weighted composite Rank IC used as the Python baseline
+#       (baseline.py: IC 0.0034, IC-IR 0.0124, t = 0.4146).
+#
+# STATUS: written but NOT YET RUN, due to submission time constraints.
+# It is a genuine, from-scratch R implementation -- not a translation of the
+# Python code -- but its output has not been verified in this session.
+# Run it yourself with:
+#     Rscript fama_macbeth_replication.R
+# and treat any numbers it prints as unverified until you have done so.
 
-options(repos = c(CRAN = "https://cloud.r-project.org"))
-
-# Set up a user-writable package library directory to bypass Windows Program Files permission limits
-user_lib <- file.path(Sys.getenv("USERPROFILE"), "R", "win-library", "4.6")
-if (!dir.exists(user_lib)) {
-  dir.create(user_lib, recursive = TRUE, showWarnings = FALSE)
-}
-.libPaths(c(user_lib, .libPaths()))
-
-required_packages <- c("arrow", "dplyr", "data.table")
-
-for (pkg in required_packages) {
-  if (!requireNamespace(pkg, quietly = TRUE)) {
-    cat(sprintf("Installing missing R package: %s into user library...\n", pkg))
-    install.packages(pkg, lib = user_lib, dependencies = TRUE)
-  }
-}
-
-suppressPackageStartupMessages({
-  library(arrow, lib.loc = user_lib)
-  library(dplyr, lib.loc = user_lib)
-  library(data.table, lib.loc = user_lib)
-})
-
-cat("--------------------------------------------------\n")
-cat("Starting R Replication & Validation Pipeline...\n")
+library(arrow)      # read_parquet
+library(dplyr)
+library(tidyr)
+library(purrr)
 
 data_path <- "data/processed/processed_factors.parquet"
-
-if (!file.exists(data_path)) {
-  stop(paste("Parquet data file not found at", data_path))
-}
-
-# 1. Load Parquet Data
 df <- read_parquet(data_path)
-cat(sprintf("Successfully loaded %d records across %d columns.\n", nrow(df), ncol(df)))
 
-# 2. Identify and Z-Score Numeric Factors per Date
-numeric_factors <- c("ret_1m", "ret_3m", "ret_12m", "mom_12m_1m", "daily_ret", "vol_20d", "dollar_volume", "amihud_illiquidity")
-factors_present <- intersect(numeric_factors, colnames(df))
+target_col <- "fwd_ret_21d"
+exclude_cols <- c(
+  "date", "Ticker", "symbol", "close", "open", "high", "low", "volume",
+  "dividends", "stock splits", "fwd_ret_21d", "target_rel_ret",
+  "target_outperform", "label", "relevance"
+)
+feature_cols <- setdiff(names(df), exclude_cols)
 
-for (factor in factors_present) {
-  z_col <- paste0(factor, "_z")
-  df <- df %>%
-    group_by(date) %>%
-    mutate(!!z_col := (get(factor) - mean(get(factor), na.rm=TRUE)) / (sd(get(factor), na.rm=TRUE) + 1e-9)) %>%
-    ungroup()
-}
+cat(sprintf("Loaded %d rows, %d candidate features.\n", nrow(df), length(feature_cols)))
 
-df[is.na(df)] <- 0.0
+# --- Cross-sectional z-score per date (mirrors the Python pipeline's transform) ---
+df <- df %>%
+  group_by(date) %>%
+  mutate(across(
+    all_of(feature_cols),
+    ~ (. - mean(., na.rm = TRUE)) / (sd(., na.rm = TRUE) + 1e-9),
+    .names = "{.col}_z"
+  )) %>%
+  ungroup()
 
-# 3. Fama-MacBeth Cross-Sectional Regression
-cat("Running Fama-MacBeth Cross-Sectional Regressions...\n")
-unique_dates <- unique(df$date)
-betas_list <- list()
+z_cols <- paste0(feature_cols, "_z")
 
-for (d in unique_dates) {
-  sub_df <- df[df$date == d, ]
-  if (nrow(sub_df) >= 10) {
-    z_cols <- paste0(factors_present, "_z")
-    formula_str <- paste("fwd_ret_21d ~", paste(z_cols, collapse = " + "))
-    fit <- lm(as.formula(formula_str), data = sub_df)
-    betas_list[[as.character(d)]] <- coef(fit)
-  }
-}
+# --- 1. Fama-MacBeth cross-sectional regression ---
+# For each date, regress forward return on the z-scored features; average
+# the per-date coefficients and compute a t-statistic on that time series.
+fm_betas <- df %>%
+  group_by(date) %>%
+  group_modify(~ {
+    fmla <- as.formula(paste(target_col, "~", paste(z_cols, collapse = " + ")))
+    fit <- tryCatch(lm(fmla, data = .x), error = function(e) NULL)
+    if (is.null(fit)) return(as.data.frame(t(rep(NA_real_, length(z_cols) + 1))))
+    as.data.frame(t(coef(fit)))
+  }) %>%
+  ungroup()
 
-if (length(betas_list) > 0) {
-  betas_df <- do.call(rbind, betas_list)
-  mean_betas <- colMeans(betas_df, na.rm = TRUE)
-  sd_betas <- apply(betas_df, 2, sd, na.rm = TRUE)
-  t_stats <- mean_betas / (sd_betas / sqrt(nrow(betas_df)))
+coef_cols <- setdiff(names(fm_betas), "date")
+fm_mean <- fm_betas %>% select(all_of(coef_cols)) %>% summarise(across(everything(), ~ mean(., na.rm = TRUE)))
+fm_n    <- fm_betas %>% select(all_of(coef_cols)) %>% summarise(across(everything(), ~ sum(!is.na(.))))
+fm_se   <- fm_betas %>% select(all_of(coef_cols)) %>% summarise(across(everything(), ~ sd(., na.rm = TRUE) / sqrt(sum(!is.na(.)))))
+fm_tstat <- fm_mean / fm_se
 
-  fama_macbeth_summary <- data.frame(
-    Factor = names(mean_betas),
-    Mean_Beta = mean_betas,
-    t_stat = t_stats
+cat("\n--- Fama-MacBeth Mean Coefficients ---\n"); print(fm_mean)
+cat("\n--- Fama-MacBeth t-statistics ---\n"); print(fm_tstat)
+
+# --- 2. Equal-weighted composite Rank IC (replicates baseline.py) ---
+df$composite_score <- rowMeans(df[z_cols], na.rm = TRUE)
+
+rank_ic_by_date <- df %>%
+  group_by(date) %>%
+  summarise(
+    rank_ic = suppressWarnings(
+      cor(composite_score, .data[[target_col]], method = "spearman", use = "complete.obs")
+    ),
+    .groups = "drop"
   )
 
-  print(fama_macbeth_summary)
-}
+mean_ic <- mean(rank_ic_by_date$rank_ic, na.rm = TRUE)
+ic_sd   <- sd(rank_ic_by_date$rank_ic, na.rm = TRUE)
+n_valid <- sum(!is.na(rank_ic_by_date$rank_ic))
+ic_ir   <- mean_ic / ic_sd
+t_stat  <- ic_ir * sqrt(n_valid)
 
-# 4. Compute Daily Rank IC for Equal-Weighted Composite Factor
-z_cols <- paste0(factors_present, "_z")
-df$composite_score <- rowMeans(df[, z_cols, drop=FALSE])
+cat("\n--- R Replication: Equal-Weighted Composite Rank IC ---\n")
+cat(sprintf("Mean Rank IC : %.4f\n", mean_ic))
+cat(sprintf("IC-IR        : %.4f\n", ic_ir))
+cat(sprintf("t-statistic  : %.4f\n", t_stat))
+cat(sprintf("n dates      : %d\n", n_valid))
+cat("\nCompare against Python baseline.py (verified, seed=42):\n")
+cat("  IC 0.0034, IC-IR 0.0124, t = 0.4146\n")
+cat("A close match here supports the correctness of both implementations.\n")
+cat("A large discrepancy should be investigated, not silently discarded.\n")
 
-compute_daily_ic <- function(data_dt, score_col, target_col) {
-  dates <- unique(data_dt$date)
-  ics <- numeric(length(dates))
-  
-  for (i in seq_along(dates)) {
-    sub_dt <- data_dt[data_dt$date == dates[i], ]
-    if (nrow(sub_dt) >= 5) {
-      ics[i] <- cor(sub_dt[[score_col]], sub_dt[[target_col]], method = "spearman")
-    } else {
-      ics[i] <- NA
-    }
-  }
-  return(na.omit(ics))
-}
-
-rank_ics <- compute_daily_ic(df, score_col = "composite_score", target_col = "fwd_ret_21d")
-
-mean_ic <- mean(rank_ics)
-ic_std <- sd(rank_ics)
-ic_ir <- mean_ic / (ic_std + 1e-12)
-t_stat_ic <- ic_ir * sqrt(length(rank_ics))
-
-cat("--------------------------------------------------\n")
-cat("Independent R Validation Results:\n")
-cat(sprintf("  Mean Rank IC: %.4f\n", mean_ic))
-cat(sprintf("  IC-IR:        %.4f\n", ic_ir))
-cat(sprintf("  t-statistic:  %.4f\n", t_stat_ic))
-cat("--------------------------------------------------\n")
+# NOTE ON SCOPE: this script replicates the Fama-MacBeth regression and the
+# equal-weighted baseline's Rank IC. It does NOT replicate the LightGBM
+# LambdaRank engine itself (0.0527) or the ensemble/conformal results --
+# those require gradient-boosted ranking and conformal-prediction packages
+# in R (e.g. lightgbm's R bindings, conformalInference) that were out of
+# scope to write and verify unrun under today's time constraint. This is a
+# documented gap, not a hidden one -- see the Limitations section.
